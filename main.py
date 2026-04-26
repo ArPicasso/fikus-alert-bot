@@ -46,7 +46,7 @@ app = FastAPI(lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["POST", "OPTIONS"],
+    allow_methods=["GET", "HEAD", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -59,7 +59,7 @@ class Lead(BaseModel):
     budget:  str | None = None
 
 
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 def health():
     return {"status": "ok"}
 
