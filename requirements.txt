@@ -6,3 +6,4 @@ pydantic>=2.10.0
 python-telegram-bot==21.6
 gspread==6.1.2
 google-auth>=2.29.0
+instagrapi>=2.0.0

@@ -1,6 +1,7 @@
 import html
 import asyncio
 import logging
+import os
 import warnings
 from datetime import datetime
 
@@ -22,6 +23,7 @@ from telegram.error import BadRequest
 
 from config import BOT_TOKEN, CHAT_ID, TOPIC_ID, SPREADSHEET_ID
 import sheets
+from hunter_utils import format_hunter_card, build_hunter_keyboard as _build_hunter_kb
 
 logger = logging.getLogger(__name__)
 
@@ -428,6 +430,126 @@ async def cmd_partners(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
+# ── Hunter callbacks ───────────────────────────────────────────────────────
+
+HUNTER_STATUS_MAP = {
+    "contact":  "Связались",
+    "pipeline": "В pipeline",
+    "skip30":   "Отложено",
+    "reject":   "Не целевой",
+}
+
+IG_ENABLED = bool(os.getenv("IG_USERNAME") and os.getenv("IG_PASSWORD"))
+
+
+async def handle_hunter_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик кнопок на Hunter-карточке (prefix hl:)."""
+    query = update.callback_query
+    await query.answer()
+
+    # Формат: hl:H-001:contact
+    parts = query.data.split(":")   # ['hl', 'H-001', 'contact']
+    if len(parts) < 3:
+        return
+
+    hunter_id  = parts[1]           # H-001
+    action     = parts[2]           # contact | pipeline | skip30 | reject
+    new_status = HUNTER_STATUS_MAP.get(action, "Неизвестно")
+    now        = datetime.now().strftime("%d.%m.%Y %H:%M")
+
+    contacted_at = now if action == "contact" else ""
+    await asyncio.to_thread(
+        sheets.update_hunter_lead_status, hunter_id, new_status, contacted_at
+    )
+
+    lead = await asyncio.to_thread(sheets.get_hunter_lead, hunter_id)
+    if not lead:
+        await query.answer("Лид не найден в таблице", show_alert=True)
+        return
+
+    text = format_hunter_card(hunter_id, lead, status=new_status)
+    keyboard = _build_hunter_kb(
+        hunter_id,
+        phone=lead.get("phone", ""),
+        maps_link=lead.get("maps_link", ""),
+        instagram=lead.get("instagram", ""),
+        status=new_status,
+    )
+
+    try:
+        await query.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+    except BadRequest as e:
+        if "Message is not modified" not in str(e):
+            raise
+
+
+# ── Instagram DM handler ──────────────────────────────────────────────────
+
+async def handle_instagram_dm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Ручная отправка Instagram DM по кнопке в карточке лида."""
+    query = update.callback_query
+    await query.answer()
+
+    if not IG_ENABLED:
+        await query.answer("IG_USERNAME/IG_PASSWORD не настроены в .env", show_alert=True)
+        return
+
+    hunter_id = query.data.split(":")[1]
+    lead = await asyncio.to_thread(sheets.get_hunter_lead, hunter_id)
+    if not lead:
+        await query.answer("Лид не найден в таблице", show_alert=True)
+        return
+
+    ig_url = (lead.get("instagram") or "").strip()
+    if not ig_url:
+        await query.answer("У этого лида нет Instagram", show_alert=True)
+        return
+
+    await query.answer("Отправляю DM...")
+
+    try:
+        import instagram_dm
+        username = await asyncio.to_thread(
+            instagram_dm.send_dm,
+            ig_url,
+            lead.get("name", ""),
+            lead.get("niche", ""),
+            str(lead.get("rating", "")),
+            str(lead.get("reviews_count", "")),
+            lead.get("city", ""),
+        )
+        now = datetime.now().strftime("%d.%m.%Y %H:%M")
+        await asyncio.to_thread(
+            sheets.update_hunter_lead_status,
+            hunter_id, "Написали в Instagram", now,
+        )
+        new_status = "Написали в Instagram"
+        text = format_hunter_card(hunter_id, lead, status=new_status)
+        keyboard = _build_hunter_kb(
+            hunter_id,
+            phone=lead.get("phone", ""),
+            maps_link=lead.get("maps_link", ""),
+            instagram=lead.get("instagram", ""),
+            status=new_status,
+        )
+        try:
+            await query.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+        except BadRequest as e:
+            if "Message is not modified" not in str(e):
+                raise
+        count = instagram_dm.today_count()
+        await query.message.reply_text(
+            f"📸 DM отправлен → <b>@{h(username)}</b>\n"
+            f"Сегодня отправлено: {count}/{instagram_dm.DAILY_LIMIT}",
+            parse_mode="HTML",
+        )
+    except RuntimeError as e:
+        await query.message.reply_text(f"⚠️ {h(str(e))}", parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"Instagram DM ошибка: {e}", exc_info=True)
+        await query.message.reply_text(f"❌ Ошибка отправки: {h(str(e))}", parse_mode="HTML")
+
+
 # ── Application setup ──────────────────────────────────────────────────────
 
 conv_handler = ConversationHandler(
@@ -455,7 +577,9 @@ application = (
     .build()
 )
 application.add_handler(conv_handler)
-application.add_handler(CallbackQueryHandler(handle_status, pattern="^st:"))
+application.add_handler(CallbackQueryHandler(handle_status,        pattern="^st:"))
+application.add_handler(CallbackQueryHandler(handle_hunter_status, pattern="^hl:"))
+application.add_handler(CallbackQueryHandler(handle_instagram_dm,  pattern="^ig:"))
 application.add_handler(CommandHandler("pending",  cmd_pending))
 application.add_handler(CommandHandler("partners", cmd_partners))
 application.add_handler(CommandHandler("help",     cmd_help))
